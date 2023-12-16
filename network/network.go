@@ -3,6 +3,7 @@ package network
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 )
 
@@ -18,15 +19,8 @@ iface <foo> inet static
 */
 
 const DEFAULT_NETWORK_INTERFACES = "/root/etc/network/interfaces"
-
-type Interface struct {
-	Name    string `json:"name"`
-	Auto    bool   `json:"auto"`
-	DHCP    bool   `json:"dhcp"`
-	Address string `json:"ip"`
-	Netmask string `json:"netmask"`
-	Gateway string `json:"gateway"`
-}
+const IFUP = "/usr/sbin/ifup"
+const IFDOWN = "/usr/sbin/ifdown"
 
 func getNetworkPath() string {
 	path, exists := os.LookupEnv("NETWORK_INTERFACES_PATH")
@@ -38,76 +32,52 @@ func getNetworkPath() string {
 	return path
 }
 
-func ParseInterfaces() (map[string]*Interface, error) {
-	path := getNetworkPath()
-	body, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-
-	ifaces := make(map[string]*Interface)
-	lines := strings.Split(string(body[:]), "\n")
-
-	var iface *Interface = nil
-	var name string
-	var ok bool
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		parts := strings.Split(line, " ")
-
-		if parts[0] == "auto" {
-			name = parts[1]
-			if iface != nil {
-				ifaces[iface.Name] = iface
-			}
-			iface, ok = ifaces[name]
-			if !ok {
-				iface = &Interface{Name: name}
-			}
-			iface.Auto = true
-		} else if parts[0] == "iface" {
-			name = parts[1]
-			if iface != nil {
-				ifaces[iface.Name] = iface
-			}
-			iface, ok = ifaces[name]
-			if !ok {
-				iface = &Interface{Name: name}
-			}
-			iface.DHCP = (parts[3] == "dhcp")
-		} else if parts[0] == "address" {
-			iface.Address = parts[1]
-		} else if parts[0] == "netmask" {
-			iface.Netmask = parts[1]
-		} else if parts[0] == "gateway" {
-			iface.Gateway = parts[1]
-		}
-	}
-	if iface != nil {
-		ifaces[iface.Name] = iface
-	}
-
-	return ifaces, nil
+type Interface struct {
+	Name    string `json:"name"`
+	Auto    bool   `json:"auto"`
+	DHCP    bool   `json:"dhcp"`
+	Address string `json:"ip"`
+	Netmask string `json:"netmask"`
+	Gateway string `json:"gateway"`
 }
+type Interfaces map[string]*Interface
 
-func getMode(iface *Interface) string {
-	if iface.DHCP {
+func (self *Interface) GetModeString() string {
+	if self.DHCP {
 		return "dhcp"
 	} else {
 		return "static"
 	}
 }
 
-func SaveInterfaces(ifaces map[string]*Interface) error {
-	path := getNetworkPath()
+func (self *Interface) Up() error {
+	s := fmt.Sprintf("%s %s", IFUP, self.Name)
+	cmd := exec.Command(s)
+	return cmd.Run()
+}
+
+func (self *Interface) Down() error {
+	s := fmt.Sprintf("%s %s", IFDOWN, self.Name)
+	cmd := exec.Command(s)
+	return cmd.Run()
+}
+
+func (self *Interface) Reload() error {
+	err := self.Down()
+	if err != nil {
+		return err
+	}
+	return self.Up()
+}
+
+func (self Interfaces) Save() error {
 	var lines []string
 
-	for _, iface := range ifaces {
+	for _, iface := range self {
 		if iface.Auto {
 			lines = append(lines, fmt.Sprintf("auto %s", iface.Name))
 		}
-		mode := getMode(iface)
-		lines = append(lines, fmt.Sprintf("iface %s inet %s", iface.Name, mode))
+		lines = append(lines, fmt.Sprintf("iface %s inet %s", iface.Name, iface.GetModeString()))
 		if !iface.DHCP {
 			lines = append(lines, fmt.Sprintf("\taddress %s", iface.Address))
 			lines = append(lines, fmt.Sprintf("\tnetmask %s", iface.Netmask))
@@ -115,10 +85,116 @@ func SaveInterfaces(ifaces map[string]*Interface) error {
 		}
 	}
 
-	err := os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0666)
+	err := os.WriteFile(getNetworkPath(), []byte(strings.Join(lines, "\n")), 0666)
 	if err != nil {
 		return err
 	}
 
 	return nil
+}
+
+func (self Interfaces) Create(name string) *Interface {
+	iface := &Interface{Name: name}
+	self[name] = iface
+	return iface
+}
+
+func (self Interfaces) Add(iface *Interface) {
+	self[iface.Name] = iface
+}
+
+func (self Interfaces) Get(name string) *Interface {
+	iface, ok := self[name]
+	if !ok {
+		return nil
+	}
+	return iface
+}
+
+func (self Interfaces) GetOrAdd(name string) *Interface {
+	iface := self.Get(name)
+	if iface == nil {
+		iface = &Interface{Name: name}
+		self.Add(iface)
+	}
+	return iface
+}
+
+func (self Interfaces) Has(name string) bool {
+	_, ok := self[name]
+	return ok
+}
+
+func (self Interfaces) Remove(name string) {
+	delete(self, name)
+}
+
+func (self Interfaces) Values() []Interface {
+	iface_list := make([]Interface, 0, len(self))
+	for _, v := range self {
+		iface_list = append(iface_list, *v)
+	}
+	return iface_list
+}
+
+func FromList(iface_list []*Interface) *Interfaces {
+	ifaces := &Interfaces{}
+	for _, v := range iface_list {
+		ifaces.Add(v)
+	}
+	return ifaces
+}
+
+func Load() (*Interfaces, error) {
+	ifaces := &Interfaces{}
+	f, err := os.Open("/sys/class/net")
+	if err != nil {
+		return nil, err
+	}
+	files, err := f.ReadDir(0)
+	if err != nil {
+		return nil, err
+	}
+	for _, v := range files {
+		name := v.Name()
+		if name == "docker0" {
+			continue
+		}
+		ifaces.Create(v.Name())
+	}
+
+	body, err := os.ReadFile(getNetworkPath())
+	if err != nil {
+		return nil, err
+	}
+
+	var iface *Interface = nil
+	var name string
+
+	lines := strings.Split(string(body[:]), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		parts := strings.Split(line, " ")
+
+		if parts[0] == "auto" {
+			name = parts[1]
+			iface = ifaces.GetOrAdd(name)
+			iface.Auto = true
+			iface = nil
+		} else if parts[0] == "iface" {
+			name = parts[1]
+			iface = ifaces.GetOrAdd(name)
+			iface.DHCP = (parts[3] == "dhcp")
+		} else if iface != nil {
+			if parts[0] == "address" {
+				iface.Address = parts[1]
+			} else if iface != nil && parts[0] == "netmask" {
+				iface.Netmask = parts[1]
+			} else if parts[0] == "gateway" {
+				iface.Gateway = parts[1]
+			}
+		}
+	}
+
+	return ifaces, nil
 }

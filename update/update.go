@@ -48,5 +48,5 @@ func getArchVersion() (string, string, error) {
 }
 
 func CheckUpdates() {
-
+	// foo
 }
